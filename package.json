@@ -1,0 +1,13 @@
+{
+  "name": "autovideo-render",
+  "version": "1.0.0",
+  "description": "Servicio de render de videos verticales (Ken Burns + subtitulos + musica) para el flujo de videos religiosos automaticos.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
