@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM public.ecr.aws/docker/library/node:20-slim
 
 # ffmpeg viene en los repos de Debian; esta imagen (a diferencia de la de n8n)
 # sí tiene apt, así que se instala normal.
