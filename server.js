@@ -130,7 +130,7 @@ async function armarEscena(dirTmp, i, escena) {
   const drawtext =
     `drawtext=textfile='${archivoTexto.replace(/\\/g, "/").replace(/:/g, "\\:")}':` +
     `fontcolor=yellow:fontsize=52:borderw=6:bordercolor=black:` +
-    `x=(w-text_w)/2:y=h-420:line_spacing=14:text_align=center`;
+    `x=(w-text_w)/2:y=h-420:line_spacing=14`;
 
   await ejecutar("ffmpeg", [
     "-y",
