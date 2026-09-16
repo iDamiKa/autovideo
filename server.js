@@ -84,14 +84,25 @@ async function duracionDe(archivo) {
   return parseFloat(salida.trim());
 }
 
-// Escapa texto para el filtro drawtext de FFmpeg (comillas, dos puntos, saltos).
-function escaparParaDrawtext(texto) {
-  return texto
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\u2019")
-    .replace(/\n/g, " ")
-    .slice(0, 220);
+// Parte el texto en l\u00edneas cortas para que nunca se salga de los bordes del
+// video. drawtext no ajusta texto solo, as\u00ed que el salto de l\u00ednea real se hace
+// aqu\u00ed y se pasa por archivo (textfile), que evita todo el l\u00edo de escapar
+// comillas/dos puntos que s\u00ed hace falta cuando el texto va inline en el filtro.
+function partirEnLineas(texto, maxCaracteres) {
+  const palabras = (texto || "").replace(/\s+/g, " ").trim().split(" ");
+  const lineas = [];
+  let actual = "";
+  for (const palabra of palabras) {
+    const candidata = actual ? `${actual} ${palabra}` : palabra;
+    if (candidata.length > maxCaracteres && actual) {
+      lineas.push(actual);
+      actual = palabra;
+    } else {
+      actual = candidata;
+    }
+  }
+  if (actual) lineas.push(actual);
+  return lineas.join("\n");
 }
 
 // --- el render en sí ---------------------------------------------------------
@@ -111,11 +122,15 @@ async function armarEscena(dirTmp, i, escena) {
   const zoompan =
     `zoompan=z='min(zoom+0.0008,1.15)':d=${totalFrames}:s=${ANCHO}x${ALTO}:fps=${fps}`;
 
-  const textoEscapado = escaparParaDrawtext(escena.texto || "");
+  // Amarillo con borde negro grueso (look clásico de subtítulo religioso/redes),
+  // en vez de texto blanco sobre caja — y partido en líneas para que no se
+  // desborde a los costados.
+  const archivoTexto = path.join(dirTmp, `texto${i}.txt`);
+  fs.writeFileSync(archivoTexto, partirEnLineas(escena.texto, 24));
   const drawtext =
-    `drawtext=text='${textoEscapado}':fontcolor=white:fontsize=46:` +
-    `box=1:boxcolor=black@0.45:boxborderw=20:x=(w-text_w)/2:y=h-380:` +
-    `line_spacing=8`;
+    `drawtext=textfile='${archivoTexto.replace(/\\/g, "/").replace(/:/g, "\\:")}':` +
+    `fontcolor=yellow:fontsize=52:borderw=6:bordercolor=black:` +
+    `x=(w-text_w)/2:y=h-420:line_spacing=14:text_align=center`;
 
   await ejecutar("ffmpeg", [
     "-y",
