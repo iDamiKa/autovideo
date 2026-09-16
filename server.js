@@ -265,7 +265,7 @@ async function armarVideo({ escenas, musicaUrl }) {
       "-i", sinMusica,
       "-stream_loop", "-1", "-i", musica,
       "-filter_complex",
-      `[1:a]volume=0.12[musicabaja];[0:a][musicabaja]amix=inputs=2:duration=first:dropout_transition=2[audio]`,
+      `[1:a]volume=0.22[musicabaja];[0:a][musicabaja]amix=inputs=2:duration=first:dropout_transition=2[audio]`,
       "-map", "0:v",
       "-map", "[audio]",
       "-c:v", "copy",
