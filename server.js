@@ -85,11 +85,9 @@ async function duracionDe(archivo) {
 }
 
 // Parte el texto en l\u00edneas cortas para que nunca se salga de los bordes del
-// video. drawtext no ajusta texto solo, as\u00ed que el salto de l\u00ednea real se hace
-// aqu\u00ed y se pasa por archivo (textfile), que evita todo el l\u00edo de escapar
-// comillas/dos puntos que s\u00ed hace falta cuando el texto va inline en el filtro.
+// video (drawtext no ajusta texto solo).
 function partirEnLineas(texto, maxCaracteres) {
-  const palabras = (texto || "").replace(/\s+/g, " ").trim().split(" ");
+  const palabras = (texto || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
   const lineas = [];
   let actual = "";
   for (const palabra of palabras) {
@@ -102,10 +100,32 @@ function partirEnLineas(texto, maxCaracteres) {
     }
   }
   if (actual) lineas.push(actual);
-  return lineas.join("\n");
+  return lineas;
+}
+
+// Agrupa las l\u00edneas en bloques de m\u00e1ximo 2 (para que nunca se vea un muro de
+// texto), y le da a cada bloque una ventana de tiempo proporcional a cu\u00e1ntas
+// palabras tiene \u2014 as\u00ed el subt\u00edtulo cambia m\u00e1s o menos al ritmo de la voz,
+// aunque Google TTS no nos d\u00e9 marcas de tiempo exactas por palabra.
+function armarBloques(lineas, duracionEscena, maxLineasPorBloque = 2) {
+  const bloques = [];
+  for (let i = 0; i < lineas.length; i += maxLineasPorBloque) {
+    bloques.push(lineas.slice(i, i + maxLineasPorBloque));
+  }
+  const palabrasPorBloque = bloques.map((b) => b.join(" ").split(" ").length);
+  const totalPalabras = palabrasPorBloque.reduce((a, b) => a + b, 0) || 1;
+  let acumulado = 0;
+  return bloques.map((lineasBloque, idx) => {
+    const inicio = (acumulado / totalPalabras) * duracionEscena;
+    acumulado += palabrasPorBloque[idx];
+    const fin = (acumulado / totalPalabras) * duracionEscena;
+    return { lineas: lineasBloque, inicio, fin };
+  });
 }
 
 // --- el render en sí ---------------------------------------------------------
+
+const CROSSFADE = 0.6; // segundos de transición entre escenas: clásica, no exagerada
 
 async function armarEscena(dirTmp, i, escena) {
   const imagen = path.join(dirTmp, `img${i}.jpg`);
@@ -122,30 +142,42 @@ async function armarEscena(dirTmp, i, escena) {
   const zoompan =
     `zoompan=z='min(zoom+0.0008,1.15)':d=${totalFrames}:s=${ANCHO}x${ALTO}:fps=${fps}`;
 
-  // Amarillo con borde negro grueso (look clásico de subtítulo religioso/redes),
-  // en vez de texto blanco sobre caja — y partido en líneas para que no se
-  // desborde a los costados.
-  const archivoTexto = path.join(dirTmp, `texto${i}.txt`);
-  fs.writeFileSync(archivoTexto, partirEnLineas(escena.texto, 24));
-  const drawtext =
-    `drawtext=textfile='${archivoTexto.replace(/\\/g, "/").replace(/:/g, "\\:")}':` +
-    `fontcolor=yellow:fontsize=52:borderw=6:bordercolor=black:` +
-    `x=(w-text_w)/2:y=h-420:line_spacing=14`;
+  // Subtítulo en bloques de máximo 2 líneas, cada uno visible solo durante su
+  // ventana de tiempo (sincronizado a la voz), amarillo con borde negro. Cada
+  // línea es su propio drawtext para que quede centrada de verdad: la versión
+  // de FFmpeg de este contenedor no trae la opción "text_align".
+  const lineas = partirEnLineas(escena.texto, 26);
+  const bloques = armarBloques(lineas, dur, 2);
+  const fontsize = 54;
+  const lineHeight = fontsize + 18;
+  const yBase = Math.round(ALTO * 0.56); // más al centro vertical, no pegado abajo
+
+  const drawtexts = [];
+  bloques.forEach((bloque, bi) => {
+    bloque.lineas.forEach((linea, li) => {
+      const archivoTexto = path.join(dirTmp, `texto${i}_${bi}_${li}.txt`);
+      fs.writeFileSync(archivoTexto, linea);
+      const rutaEscapada = archivoTexto.replace(/\\/g, "/").replace(/:/g, "\\:");
+      const y = yBase + li * lineHeight;
+      drawtexts.push(
+        `drawtext=textfile='${rutaEscapada}':fontcolor=yellow:fontsize=${fontsize}:` +
+          `borderw=6:bordercolor=black:x=(w-text_w)/2:y=${y}:` +
+          `enable='between(t,${bloque.inicio.toFixed(2)},${bloque.fin.toFixed(2)})'`
+      );
+    });
+  });
 
   await ejecutar("ffmpeg", [
     "-y",
     "-loop", "1",
     "-i", imagen,
-    "-i", audio,
     "-filter_complex",
     `[0:v]scale=${ANCHO * 2}:${ALTO * 2}:force_original_aspect_ratio=increase,` +
-      `crop=${ANCHO * 2}:${ALTO * 2},${zoompan},${drawtext}[v]`,
+      `crop=${ANCHO * 2}:${ALTO * 2},${zoompan},${drawtexts.join(",")}[v]`,
     "-map", "[v]",
-    "-map", "1:a",
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
     "-t", String(dur),
     clip,
   ]);
@@ -161,19 +193,64 @@ async function armarVideo({ escenas, musicaUrl }) {
       partes.push(await armarEscena(dirTmp, i, escenas[i]));
     }
 
-    const duracionTotal = partes.reduce((a, p) => a + p.dur, 0);
-
-    // Concatena los clips (ya traen su propio audio de voz).
-    const listaConcat = path.join(dirTmp, "lista.txt");
-    fs.writeFileSync(
-      listaConcat,
-      partes.map((p) => `file '${p.clip.replace(/'/g, "'\\''")}'`).join("\n")
-    );
     const sinMusica = path.join(dirTmp, "sin_musica.mp4");
-    await ejecutar("ffmpeg", [
-      "-y", "-f", "concat", "-safe", "0", "-i", listaConcat,
-      "-c", "copy", sinMusica,
-    ]);
+    let duracionTotal;
+
+    if (partes.length === 1) {
+      // Una sola escena: no hay nada que fundir entre sí.
+      duracionTotal = partes[0].dur;
+      await ejecutar("ffmpeg", [
+        "-y", "-i", partes[0].clip, "-i", partes[0].audio,
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "copy", "-c:a", "aac",
+        sinMusica,
+      ]);
+    } else {
+      // Encadena una transición cruzada (fundido clásico) entre cada escena y
+      // la siguiente, tanto en video (xfade) como en el audio de voz
+      // (acrossfade), para que no se note un corte seco de imagen a imagen.
+      const inputs = [];
+      partes.forEach((p) => inputs.push("-i", p.clip));
+      partes.forEach((p) => inputs.push("-i", p.audio));
+      const nEscenas = partes.length;
+
+      let filtro = "";
+      let vPrev = "0:v";
+      let acumulado = partes[0].dur;
+      for (let k = 1; k < nEscenas; k++) {
+        const offset = (acumulado - CROSSFADE).toFixed(3);
+        const vOut = k === nEscenas - 1 ? "vout" : `v0${k}`;
+        filtro += `[${vPrev}][${k}:v]xfade=transition=fade:duration=${CROSSFADE}:offset=${offset}[${vOut}];`;
+        vPrev = vOut;
+        acumulado = acumulado + partes[k].dur - CROSSFADE;
+      }
+      duracionTotal = acumulado;
+
+      let aPrev = `${nEscenas}:a`; // los inputs de audio empiezan después de los N de video
+      for (let k = 1; k < nEscenas; k++) {
+        const aOut = k === nEscenas - 1 ? "aout" : `a0${k}`;
+        filtro += `[${aPrev}][${nEscenas + k}:a]acrossfade=d=${CROSSFADE}[${aOut}];`;
+        aPrev = aOut;
+      }
+
+      // Color cálido suave + viñeta (look "vela/atardecer") y fundido de
+      // entrada/salida del video completo.
+      const fadeOutInicio = Math.max(0, duracionTotal - 0.8).toFixed(2);
+      filtro += `[vout]eq=saturation=1.12:gamma_r=1.03:gamma_b=0.97,vignette=PI/6,fade=t=in:st=0:d=0.6,fade=t=out:st=${fadeOutInicio}:d=0.8[vfinal]`;
+
+      await ejecutar("ffmpeg", [
+        "-y",
+        ...inputs,
+        "-filter_complex", filtro,
+        "-map", "[vfinal]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        sinMusica,
+      ]);
+    }
 
     if (!musicaUrl) {
       return sinMusica;
