@@ -279,6 +279,200 @@ async function armarVideo({ escenas, musicaUrl }) {
   }
 }
 
+// --- montaje a partir de clips ya grabados (Google Flow) ---------------------
+//
+// Es un camino distinto al de /render: alla se parte de imagenes fijas y se les
+// inventa movimiento; aca los clips ya vienen con su propio movimiento y
+// duracion, y lo unico que hace falta es unirlos, ponerles el audio y quemar
+// los subtitulos. Por eso no se reusa armarEscena(): nada de Ken Burns.
+
+async function tieneAudio(archivo) {
+  let salida = "";
+  await new Promise((resolve, reject) => {
+    const proc = spawn("ffprobe", [
+      "-v", "error",
+      "-select_streams", "a",
+      "-show_entries", "stream=index",
+      "-of", "csv=p=0",
+      archivo,
+    ]);
+    proc.stdout.on("data", (d) => (salida += d.toString()));
+    proc.on("close", () => resolve());
+    proc.on("error", reject);
+  });
+  return salida.trim().length > 0;
+}
+
+// Deja cada clip en el mismo formato (1080x1920, 30fps, con pista de audio
+// siempre presente aunque sea muda) y le quema su subtitulo. Sin esto, xfade
+// falla apenas un clip viene con otra resolucion o sin audio -y los clips de
+// Flow vienen de todo.
+async function normalizarClip(dirTmp, i, escena) {
+  const entrada = path.join(dirTmp, `clip_in${i}.mp4`);
+  const salida = path.join(dirTmp, `clip${i}.mp4`);
+
+  await descargar(escena.videoUrl, entrada);
+  const dur = await duracionDe(entrada);
+  const conAudio = await tieneAudio(entrada);
+
+  const cadenaVideo = [
+    `scale=${ANCHO}:${ALTO}:force_original_aspect_ratio=increase`,
+    `crop=${ANCHO}:${ALTO}`,
+    "fps=30",
+  ];
+
+  if (escena.texto && escena.texto.trim()) {
+    const lineas = partirEnLineas(escena.texto, 26);
+    const bloques = armarBloques(lineas, dur, 2);
+    const fontsize = 54;
+    const lineHeight = fontsize + 18;
+    const yBase = Math.round(ALTO * 0.56);
+
+    bloques.forEach((bloque, bi) => {
+      bloque.lineas.forEach((linea, li) => {
+        const archivoTexto = path.join(dirTmp, `txt${i}_${bi}_${li}.txt`);
+        fs.writeFileSync(archivoTexto, linea);
+        const rutaEscapada = archivoTexto.replace(/\\/g, "/").replace(/:/g, "\\:");
+        cadenaVideo.push(
+          `drawtext=textfile='${rutaEscapada}':fontcolor=yellow:fontsize=${fontsize}:` +
+            `borderw=6:bordercolor=black:x=(w-text_w)/2:y=${yBase + li * lineHeight}:` +
+            `enable='between(t,${bloque.inicio.toFixed(2)},${bloque.fin.toFixed(2)})'`
+        );
+      });
+    });
+  }
+
+  const args = ["-y", "-i", entrada];
+  if (!conAudio) {
+    args.push("-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100");
+  }
+  args.push(
+    "-filter_complex", `[0:v]${cadenaVideo.join(",")}[v]`,
+    "-map", "[v]",
+    "-map", conAudio ? "0:a" : "1:a",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-t", String(dur),
+    salida,
+  );
+  await ejecutar("ffmpeg", args);
+
+  return { clip: salida, dur };
+}
+
+async function montarDesdeClips({ escenas, vozUrl, musicaUrl }) {
+  const dirTmp = fs.mkdtempSync(path.join(os.tmpdir(), "montaje-"));
+
+  const partes = [];
+  for (let i = 0; i < escenas.length; i++) {
+    partes.push(await normalizarClip(dirTmp, i, escenas[i]));
+  }
+
+  // Cuando hay voz en off, el audio propio de los clips estorba (ambiente,
+  // respiraciones del modelo): se descarta y manda la narracion.
+  const conVoz = Boolean(vozUrl);
+  const unido = path.join(dirTmp, "unido.mp4");
+  let duracionVideo;
+
+  if (partes.length === 1) {
+    duracionVideo = partes[0].dur;
+    const fadeOut = Math.max(0, duracionVideo - 0.8).toFixed(2);
+    const args = ["-y", "-i", partes[0].clip,
+      "-filter_complex",
+      `[0:v]eq=saturation=1.12:gamma_r=1.03:gamma_b=0.97,vignette=PI/6,` +
+        `fade=t=in:st=0:d=0.6,fade=t=out:st=${fadeOut}:d=0.8[vfinal]`,
+      "-map", "[vfinal]"];
+    if (!conVoz) args.push("-map", "0:a", "-c:a", "aac");
+    args.push("-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", unido);
+    await ejecutar("ffmpeg", args);
+  } else {
+    const inputs = [];
+    partes.forEach((p) => inputs.push("-i", p.clip));
+    const n = partes.length;
+
+    let filtro = "";
+    let vPrev = "0:v";
+    let acumulado = partes[0].dur;
+    for (let k = 1; k < n; k++) {
+      const offset = (acumulado - CROSSFADE).toFixed(3);
+      const vOut = k === n - 1 ? "vout" : `v0${k}`;
+      filtro += `[${vPrev}][${k}:v]xfade=transition=fade:duration=${CROSSFADE}:offset=${offset}[${vOut}];`;
+      vPrev = vOut;
+      acumulado = acumulado + partes[k].dur - CROSSFADE;
+    }
+    duracionVideo = acumulado;
+
+    if (!conVoz) {
+      let aPrev = "0:a";
+      for (let k = 1; k < n; k++) {
+        const aOut = k === n - 1 ? "aout" : `a0${k}`;
+        filtro += `[${aPrev}][${k}:a]acrossfade=d=${CROSSFADE}[${aOut}];`;
+        aPrev = aOut;
+      }
+    }
+
+    const fadeOut = Math.max(0, duracionVideo - 0.8).toFixed(2);
+    filtro += `[vout]eq=saturation=1.12:gamma_r=1.03:gamma_b=0.97,vignette=PI/6,` +
+      `fade=t=in:st=0:d=0.6,fade=t=out:st=${fadeOut}:d=0.8[vfinal]`;
+
+    const args = ["-y", ...inputs, "-filter_complex", filtro, "-map", "[vfinal]"];
+    if (!conVoz) args.push("-map", "[aout]", "-c:a", "aac");
+    args.push("-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", unido);
+    await ejecutar("ffmpeg", args);
+  }
+
+  let actual = unido;
+  let duracionTotal = duracionVideo;
+
+  if (conVoz) {
+    const voz = path.join(dirTmp, "voz.mp3");
+    await descargar(vozUrl, voz);
+    const durVoz = await duracionDe(voz);
+    const conVozArchivo = path.join(dirTmp, "con_voz.mp4");
+
+    // Si la narracion dura mas que el video, se congela el ultimo fotograma en
+    // vez de cortar la voz a media frase.
+    const sobra = durVoz - duracionVideo;
+    const filtroVideo = sobra > 0.1
+      ? `[0:v]tpad=stop_mode=clone:stop_duration=${sobra.toFixed(2)}[v]`
+      : `[0:v]null[v]`;
+    duracionTotal = Math.max(duracionVideo, durVoz);
+
+    await ejecutar("ffmpeg", [
+      "-y", "-i", unido, "-i", voz,
+      "-filter_complex", filtroVideo,
+      "-map", "[v]", "-map", "1:a",
+      "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-t", String(duracionTotal),
+      conVozArchivo,
+    ]);
+    actual = conVozArchivo;
+  }
+
+  if (!musicaUrl) return actual;
+
+  const musica = path.join(dirTmp, "musica.mp3");
+  await descargar(musicaUrl, musica);
+  const final = path.join(dirTmp, "final.mp4");
+  await ejecutar("ffmpeg", [
+    "-y",
+    "-i", actual,
+    "-stream_loop", "-1", "-i", musica,
+    "-filter_complex",
+    `[1:a]volume=0.32[musicabaja];[0:a][musicabaja]amix=inputs=2:duration=first:dropout_transition=2[audio]`,
+    "-map", "0:v",
+    "-map", "[audio]",
+    "-c:v", "copy",
+    "-c:a", "aac",
+    "-t", String(duracionTotal),
+    final,
+  ]);
+  return final;
+}
+
 async function subirASupabase(archivoLocal, supabase) {
   const buffer = fs.readFileSync(archivoLocal);
   const url = `${supabase.url}/storage/v1/object/${supabase.bucket}/${supabase.path}`;
@@ -329,6 +523,42 @@ app.post("/render", async (req, res) => {
 
   try {
     const archivoFinal = await armarVideo({ escenas, musicaUrl });
+    const urlPublica = await subirASupabase(archivoFinal, supabase);
+    res.json({ url: urlPublica });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: String(err.message || err) });
+  }
+});
+
+// Montaje de clips ya grabados (Google Flow): une escenas con transicion, les
+// pone la voz en off -o respeta el audio de los propios clips si no hay-, mezcla
+// musica de fondo y quema subtitulos.
+//
+//   {
+//     "escenas": [ { "videoUrl": "...", "texto": "subtitulo" }, ... ],
+//     "vozUrl": "...",     // opcional: si viene, se ignora el audio de los clips
+//     "musicaUrl": "...",  // opcional
+//     "supabase": { ... }
+//   }
+app.post("/montar", async (req, res) => {
+  if (!API_KEY || req.header("x-api-key") !== API_KEY) {
+    return res.status(401).json({ error: "no autorizado" });
+  }
+
+  const { escenas, vozUrl, musicaUrl, supabase } = req.body || {};
+  if (!Array.isArray(escenas) || escenas.length === 0) {
+    return res.status(400).json({ error: "faltan escenas" });
+  }
+  if (escenas.some((e) => !e || !e.videoUrl)) {
+    return res.status(400).json({ error: "cada escena necesita su videoUrl" });
+  }
+  if (!supabase || !supabase.url || !supabase.bucket || !supabase.path || !supabase.serviceRoleKey) {
+    return res.status(400).json({ error: "falta configuración de supabase para subir el resultado" });
+  }
+
+  try {
+    const archivoFinal = await montarDesdeClips({ escenas, vozUrl, musicaUrl });
     const urlPublica = await subirASupabase(archivoFinal, supabase);
     res.json({ url: urlPublica });
   } catch (err) {
